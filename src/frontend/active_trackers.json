@@ -1,0 +1,30 @@
+[
+  {
+    "RouteId": "TRK-E117BB62",
+    "UserId": "adwaitharun2005@gmail.com",
+    "email": "adwaitharun2005@gmail.com",
+    "origin": "TRV",
+    "Origin": "TRV",
+    "destination": "BLR",
+    "Destination": "BLR",
+    "departure_date": "2026-10-20",
+    "DepartureDate": "2026-10-20",
+    "target_price": 10000.0,
+    "TargetPrice": 10000.0,
+    "current_price": 9600.0,
+    "status": "Monitoring Active",
+    "CreatedAt": "2026-10-05T05:40:28Z",
+    "created_at": "2026-10-05 11:10:28"
+  },
+  {
+    "email": "adwaitharun2005@gmail.com",
+    "origin": "TRV",
+    "destination": "BLR",
+    "target_price": 3500.0,
+    "tracker_id": "TRK-303743",
+    "created_at": "2026-09-16 17:59:27",
+    "last_checked": "2026-09-16 17:59:27",
+    "current_price": 3325.0,
+    "status": "Target Price Met"
+  }
+]
