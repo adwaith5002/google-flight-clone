@@ -137,7 +137,7 @@ def write_price_history(route_id, price, airline, timestamp=None, table_name=Non
     - Attributes: Price (Decimal/Number), Airline (String)
     """
     if timestamp is None:
-        timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     
     if table_name is None:
         table_name = PRICE_HISTORY_TABLE
@@ -153,7 +153,7 @@ def write_price_history(route_id, price, airline, timestamp=None, table_name=Non
         dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
         table = dynamodb.Table(table_name)
         table.put_item(Item=item)
-        logger.info(f"Successfully inserted price history item into DynamoDB: {item}")
+        logger.info(f"Successfully inserted price history item into DynamoDB: {json.dumps({'RouteId': str(route_id), 'Price': float(price), 'Airline': airline})}")
         return True, item
     except ClientError as e:
         logger.error(f"DynamoDB ClientError writing to {table_name}: {e}")

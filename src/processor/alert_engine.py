@@ -86,7 +86,7 @@ def get_latest_price_history(route_id):
         "RouteId": str(route_id),
         "Price": 4450.0 if str(route_id) == "TRK-001" else 2850.0,
         "Airline": "IndiGo",
-        "Timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     }
 
 
