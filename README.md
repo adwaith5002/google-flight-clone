@@ -74,8 +74,9 @@ We utilize **Amazon DynamoDB** for fast, serverless NoSQL data storage.
 ## 🚀 5. Deployment & DevOps (Rubric Criterion 6 - 2 Marks)
 
 ### Infrastructure as Code (IaC)
-- **Terraform (`infrastructure/main.tf`)**: Declarative provisioning of DynamoDB tables, SNS topics, and email subscriptions.
-- **Automated Python Provisioner (`infrastructure/setup_aws_infrastructure.py`)**: Script using `boto3` to provision AWS resources with automatic error handling.
+- **AWS CloudFormation (`infrastructure/aws_stack.yaml`)**: Deploys the authenticated Streamlit app on EC2, an HTTPS CloudFront endpoint, and the scheduled price/alert Lambda worker. It uses the existing DynamoDB tables and SNS topic in `us-east-1`.
+- **Deployment helper (`infrastructure/deploy_aws.py`)**: Packages the app and Lambda code, stores the app password in Secrets Manager, and deploys the CloudFormation stack.
+- The older Terraform/provisioner files remain available for the original DynamoDB/SNS setup.
 
 ### CI/CD Pipeline
 - **GitHub Actions (`.github/workflows/ci.yml`)**: Automated pipeline triggered on code pushes to check Python syntax compilation, dependency resolution, and run test suites.
@@ -107,6 +108,10 @@ We utilize **Amazon DynamoDB** for fast, serverless NoSQL data storage.
    ```bash
    python -m streamlit run src/frontend/app.py
    ```
+   Set `SNS_TOPIC_ARN` to the topic ARN printed by the infrastructure setup.
+   Each tracker email must confirm its SNS subscription before alerts can be
+   delivered. The first matching alert requests that subscription; after
+   confirming it, use **Check & Alert Now** or inject another fare to send.
 
 3. **Run API Ingestion Test**:
    ```bash
@@ -117,6 +122,50 @@ We utilize **Amazon DynamoDB** for fast, serverless NoSQL data storage.
    ```bash
    python src/processor/alert_engine.py
    ```
+
+## ☁️ AWS Deployment
+
+The deployment uses the existing `TrackedRoutes`, `PriceHistory`, `Users`, and
+`FlightPriceAlertsTopic` resources in **us-east-1**. Configure AWS CLI credentials
+for an identity allowed to create CloudFormation, EC2/VPC, CloudFront, Lambda,
+EventBridge, S3, Secrets Manager, and IAM resources (including `iam:PassRole`).
+
+Install the Python dependencies, then run:
+
+```powershell
+python -m pip install -r requirements.txt
+python infrastructure/deploy_aws.py
+```
+
+The script asks for an application password without echoing it, then creates a
+CloudFormation stack. It does not open SSH or expose the EC2 origin directly:
+CloudFront provides HTTPS and only CloudFront origin IPs can reach the app. The
+worker fetches fares and evaluates alerts hourly. A new tracker email must
+confirm its SNS subscription before notifications can be delivered.
+
+The EC2 instance has an ongoing charge (default `t3.small`, roughly USD 15/month
+before storage, data transfer, and other AWS usage); CloudFront and Lambda usage
+may add charges. Review AWS pricing and set a billing alert before deploying.
+
+### Deployment status and remaining steps
+
+The deployment has **not** been applied yet. The current AWS CLI identity
+(`my_user`) is missing permissions needed for deployment preflight, including
+`ec2:DescribeManagedPrefixLists` and `cloudformation:ValidateTemplate`. Switch
+to an authorized deployment profile or have an administrator grant the
+CloudFormation, EC2/VPC, CloudFront, Lambda, EventBridge, S3, Secrets Manager,
+and IAM permissions needed by the template (including `iam:PassRole`). Then
+verify the selected identity with `aws sts get-caller-identity` and run
+`python infrastructure/deploy_aws.py` again.
+
+After the stack finishes, open its `AppUrl`, sign in with the password entered
+during deployment, and confirm SNS email subscriptions for tracker addresses.
+No AWS resources were created by the failed preflight.
+
+When DynamoDB is unavailable, locally submitted trackers and injected prices
+are persisted in `src/database/local_data.json` (the app also reads its existing
+`src/frontend/active_trackers.json` tracker file). The tracker selector loads
+all DynamoDB scan pages, not just the first page.
 
 ---
 

@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Flight Monitor web app, scheduled price ingestion, and email alerts.
+
+Parameters:
+  AppBundleBucket:
+    Type: String
+  AppBundleKey:
+    Type: String
+  LambdaBundleBucket:
+    Type: String
+  LambdaBundleKey:
+    Type: String
+  AppPasswordSecretArn:
+    Type: String
+  NotificationTopicArn:
+    Type: String
+  CloudFrontOriginPrefixListId:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t3.small
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 hour)
+
+Resources:
+  AppVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: flight-monitor-vpc
+
+  AppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: flight-monitor-public-subnet
+
+  AppInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: flight-monitor-igw
+
+  AppInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AppVpc
+      InternetGatewayId: !Ref AppInternetGateway
+
+  AppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVpc
+
+  AppDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AppInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref AppRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref AppInternetGateway
+
+  AppSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnet
+      RouteTableId: !Ref AppRouteTable
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS-fronted CloudFront requests to Streamlit
+      VpcId: !Ref AppVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          SourcePrefixListId: !Ref CloudFrontOriginPrefixListId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: FlightMonitorAppAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/TrackedRoutes
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/PriceHistory
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Users
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AppPasswordSecretArn
+              - Effect: Allow
+                Action:
+                  - sns:ListSubscriptionsByTopic
+                  - sns:Publish
+                  - sns:SetSubscriptionAttributes
+                  - sns:Subscribe
+                Resource: !Ref NotificationTopicArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${AppBundleBucket}/${AppBundleKey}
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppInstanceRole
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref AppInstanceProfile
+      SubnetId: !Ref AppSubnet
+      SecurityGroupIds:
+        - !GetAtt AppSecurityGroup.GroupId
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: flight-monitor-app
+        - Key: Project
+          Value: GoogleFlightClone
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y python3 python3-pip unzip
+          command -v aws >/dev/null 2>&1 || dnf install -y awscli-2
+          id -u flightapp >/dev/null 2>&1 || useradd --system --home-dir /opt/flight-monitor --shell /sbin/nologin flightapp
+          mkdir -p /opt/flight-monitor
+          aws s3 cp s3://${AppBundleBucket}/${AppBundleKey} /tmp/flight-monitor-app.zip
+          unzip -oq /tmp/flight-monitor-app.zip -d /opt/flight-monitor
+          python3 -m venv /opt/flight-monitor/.venv
+          /opt/flight-monitor/.venv/bin/pip install --no-cache-dir -r /opt/flight-monitor/requirements.txt
+          chown -R flightapp:flightapp /opt/flight-monitor
+          cat > /etc/systemd/system/flight-monitor.service <<'UNIT'
+          [Unit]
+          Description=Flight Monitor Streamlit application
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          User=flightapp
+          Group=flightapp
+          WorkingDirectory=/opt/flight-monitor
+          Environment="AWS_REGION=${AWS::Region}"
+          Environment="SNS_TOPIC_ARN=${NotificationTopicArn}"
+          Environment="APP_PASSWORD_SECRET_ARN=${AppPasswordSecretArn}"
+          ExecStart=/opt/flight-monitor/.venv/bin/python -m streamlit run src/frontend/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now flight-monitor.service
+
+  ScheduledWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FlightMonitorWorkerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/TrackedRoutes
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/PriceHistory
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Users
+              - Effect: Allow
+                Action:
+                  - sns:ListSubscriptionsByTopic
+                  - sns:Publish
+                  - sns:SetSubscriptionAttributes
+                  - sns:Subscribe
+                Resource: !Ref NotificationTopicArn
+
+  ScheduledWorker:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FlightMonitorScheduledWorker
+      Runtime: python3.12
+      Handler: src.scheduler.lambda_handler
+      Role: !GetAtt ScheduledWorkerRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaBundleBucket
+        S3Key: !Ref LambdaBundleKey
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopicArn
+
+  ScheduledWorkerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Fetch prices and evaluate flight tracker alerts.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScheduledWorker.Arn
+          Id: ScheduledWorker
+
+  ScheduledWorkerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ScheduledWorker
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledWorkerRule.Arn
+
+  CloudFrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: FlightMonitorNoCache
+        Comment: Dynamic Streamlit pages must not be cached.
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  CloudFrontOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: FlightMonitorForwardAllViewerData
+        Comment: Streamlit requires cookies, query parameters, and WebSocket headers.
+        HeadersConfig:
+          HeaderBehavior: allViewerExceptHostHeader
+        CookiesConfig:
+          CookieBehavior: all
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: HTTPS endpoint for Flight Monitor.
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: FlightMonitorOrigin
+            DomainName: !GetAtt AppInstance.PublicDnsName
+            CustomOriginConfig:
+              HTTPPort: 8501
+              HTTPSPort: 443
+              OriginKeepaliveTimeout: 60
+              OriginReadTimeout: 60
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: FlightMonitorOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          CachePolicyId: !Ref CloudFrontCachePolicy
+          OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        HttpVersion: http2and3
+
+Outputs:
+  AppUrl:
+    Description: HTTPS URL for the authenticated Streamlit application.
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+  AppInstanceId:
+    Value: !Ref AppInstance
+  ScheduledWorkerName:
+    Value: !Ref ScheduledWorker
+  NotificationTopicArn:
+    Value: !Ref NotificationTopicArn

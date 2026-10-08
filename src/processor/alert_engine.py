@@ -6,6 +6,7 @@ import logging
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
+from src.database.local_store import latest_price_record, load_items
 
 # Set up logging
 logger = logging.getLogger()
@@ -28,31 +29,21 @@ def get_active_tracked_routes():
     try:
         dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
         table = dynamodb.Table(TRACKED_ROUTES_TABLE)
+        items = []
         response = table.scan()
-        return response.get("Items", [])
+        items.extend(response.get("Items", []))
+        while response.get("LastEvaluatedKey"):
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+        by_id = {
+            item["RouteId"]: item for item in load_items("trackers")
+            if item.get("RouteId")
+        }
+        by_id.update({item["RouteId"]: item for item in items})
+        return list(by_id.values())
     except Exception as e:
-        logger.warning(f"Could not scan DynamoDB TrackedRoutes table ({e}). Using mock active routes.")
-        # Fallback local/mock routes for testing
-        return [
-            {
-                "RouteId": "TRK-001",
-                "UserId": "adwaitharun2005@gmail.com",
-                "email": "adwaitharun2005@gmail.com",
-                "Origin": "TRV",
-                "Destination": "BLR",
-                "DepartureDate": "2026-10-17",
-                "TargetPrice": 5000.0
-            },
-            {
-                "RouteId": "TRK-002",
-                "UserId": "adwaitharun2005@gmail.com",
-                "email": "adwaitharun2005@gmail.com",
-                "Origin": "CJB",
-                "Destination": "MAA",
-                "DepartureDate": "2026-10-20",
-                "TargetPrice": 2500.0
-            }
-        ]
+        logger.warning(f"Could not scan DynamoDB TrackedRoutes table ({e})")
+        return load_items("trackers")
 
 
 def get_latest_price_history(route_id):
@@ -72,21 +63,30 @@ def get_latest_price_history(route_id):
         items = response.get("Items", [])
         if items:
             latest = items[0]
-            return {
+            dynamodb_latest = {
                 "RouteId": latest.get("RouteId"),
                 "Price": float(latest.get("Price", 0)),
                 "Airline": latest.get("Airline", "Unknown Airline"),
                 "Timestamp": latest.get("Timestamp", "")
             }
+            local_latest = latest_price_record(route_id)
+            if local_latest and local_latest.get("Timestamp", "") > dynamodb_latest["Timestamp"]:
+                return local_latest
+            return dynamodb_latest
     except Exception as e:
-        logger.warning(f"Could not query PriceHistory for route {route_id} ({e}). Using dynamic mock data.")
-    
-    # Fallback mock price observation for local evaluation testing
+        logger.warning(f"Could not query PriceHistory for route {route_id} ({e})")
+
+    local_latest = latest_price_record(route_id)
+    if local_latest:
+        return {
+            **local_latest,
+            "Price": float(local_latest["Price"]),
+        }
     return {
         "RouteId": str(route_id),
-        "Price": 4450.0 if str(route_id) == "TRK-001" else 2850.0,
-        "Airline": "IndiGo",
-        "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        "Price": 0.0,
+        "Airline": "Unknown Airline",
+        "Timestamp": ""
     }
 
 
@@ -94,7 +94,8 @@ def get_user_email(user_id):
     """
     User Lookup:
     Queries the Users DynamoDB table to retrieve user notification email address.
-    If user_id is already an email format, returns directly.
+    If user_id is already an email format, returns directly. Returns None when
+    no address is configured instead of sending alerts to an unrelated default.
     """
     if isinstance(user_id, str) and "@" in user_id:
         return user_id
@@ -107,16 +108,20 @@ def get_user_email(user_id):
         if item and "Email" in item:
             return item["Email"]
     except Exception as e:
-        logger.warning(f"User lookup failed for UserId {user_id} ({e}). Returning fallback email.")
+        logger.warning(f"User lookup failed for UserId {user_id} ({e})")
     
-    return "adwaitharun2005@gmail.com"
+    logger.warning(f"No notification email found for UserId {user_id}")
+    return None
 
 
 def send_sns_price_alert(user_email, route_info, latest_price_info):
     """
-    SNS Alert Trigger:
-    Publishes price drop notification via Amazon SNS (or mock log when offline).
+    Publishes a price alert through an email-filtered SNS topic subscription.
     """
+    if not user_email:
+        logger.error("No recipient email configured; no email was sent")
+        return False, "Recipient email is not configured"
+
     route_id = route_info.get("RouteId", "N/A")
     origin = route_info.get("Origin", route_info.get("origin", "N/A"))
     dest = route_info.get("Destination", route_info.get("destination", "N/A"))
@@ -141,19 +146,49 @@ def send_sns_price_alert(user_email, route_info, latest_price_info):
         f"— Cloud Flight Price Monitoring System"
     )
     
-    if SNS_TOPIC_ARN:
+    topic_arn = os.environ.get("SNS_TOPIC_ARN", SNS_TOPIC_ARN)
+    if topic_arn:
         try:
             sns_client = boto3.client("sns", region_name=AWS_REGION)
+            paginator = sns_client.get_paginator("list_subscriptions_by_topic")
+            subscriptions = [
+                sub for page in paginator.paginate(TopicArn=topic_arn)
+                for sub in page.get("Subscriptions", [])
+                if sub.get("Protocol") == "email"
+            ]
+            subscription = next((
+                sub for sub in subscriptions
+                if sub.get("Endpoint", "").lower() == user_email.lower()
+            ), None)
+            if not subscription:
+                sns_client.subscribe(
+                    TopicArn=topic_arn,
+                    Protocol="email",
+                    Endpoint=user_email,
+                )
+                logger.info(f"Requested SNS email subscription confirmation for {user_email}")
+                return False, "EMAIL_CONFIRMATION_REQUIRED"
+            if subscription.get("SubscriptionArn") == "PendingConfirmation":
+                return False, "EMAIL_CONFIRMATION_REQUIRED"
+            for email_subscription in subscriptions:
+                subscription_arn = email_subscription.get("SubscriptionArn")
+                endpoint = email_subscription.get("Endpoint", "").lower()
+                if subscription_arn and subscription_arn != "PendingConfirmation" and endpoint:
+                    sns_client.set_subscription_attributes(
+                        SubscriptionArn=subscription_arn,
+                        AttributeName="FilterPolicy",
+                        AttributeValue=json.dumps({"Email": [endpoint]}),
+                    )
             response = sns_client.publish(
-                TopicArn=SNS_TOPIC_ARN,
+                TopicArn=topic_arn,
                 Subject=subject,
                 Message=message,
                 MessageAttributes={
                     "Email": {
                         "DataType": "String",
-                        "StringValue": user_email
+                        "StringValue": user_email.lower()
                     }
-                }
+                },
             )
             logger.info(f"Successfully sent SNS alert message ID {response.get('MessageId')} to {user_email}")
             return True, response.get("MessageId")
@@ -161,8 +196,8 @@ def send_sns_price_alert(user_email, route_info, latest_price_info):
             logger.error(f"Failed to publish SNS message: {e}")
             return False, str(e)
     else:
-        logger.info(f"[OFFLINE/MOCK SNS ALERT]\nSubject: {subject}\nRecipient: {user_email}\nBody:\n{message}")
-        return True, "MOCK-ALERT-SENT"
+        logger.error("SNS_TOPIC_ARN is not configured; no email was sent")
+        return False, "SNS_TOPIC_ARN is not configured"
 
 
 def evaluate_route_price_alerts():
@@ -194,8 +229,11 @@ def evaluate_route_price_alerts():
             # 3. Lookup user & send alert
             user_email = get_user_email(user_id)
             success, alert_ref = send_sns_price_alert(user_email, route, latest_price_info)
-            alerts_sent += 1
-            alert_status = f"Alert Triggered ({'Sent' if success else 'Failed'})"
+            if success:
+                alerts_sent += 1
+                alert_status = "Alert accepted by SNS"
+            else:
+                alert_status = f"Alert not sent ({alert_ref})"
         
         evaluation_results.append({
             "RouteId": route_id,

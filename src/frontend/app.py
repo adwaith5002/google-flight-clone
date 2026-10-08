@@ -1,308 +1,610 @@
-import sys
-import os
-import json
-import uuid
-import datetime
-import random
-import decimal
+"""
+Google Flights – Serverless Price Monitor
+End-to-end Streamlit app:
+  Tab 1 – Search flights & set a price-drop tracker
+  Tab 2 – My active trackers (persisted via session_state + DynamoDB)
+  Tab 3 – Mock Data Injector (seed PriceHistory and fire SNS alerts)
+"""
+
+import sys, os, json, uuid, datetime, random, decimal, logging, hmac
 import pandas as pd
 import streamlit as st
 import boto3
 from botocore.exceptions import ClientError
+from src.database.local_store import load_items, save_items
 
-# Add parent directory to system path
+# ── path so we can import fetcher / alert_engine ──────────────────────────────
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
 try:
-    from src.api_fetcher.fetcher import fetch_flight_prices, write_price_history, AIRLINES
-    from src.processor.alert_engine import evaluate_route_price_alerts, send_sns_price_alert, get_latest_price_history
+    from src.api_fetcher.fetcher import write_price_history, AIRLINES
+    from src.processor.alert_engine import send_sns_price_alert, get_latest_price_history
 except ImportError:
-    pass
+    AIRLINES = [
+        {"name": "IndiGo",   "code": "6E"},
+        {"name": "Air India","code": "AI"},
+        {"name": "Akasa Air","code": "QP"},
+        {"name": "Vistara",  "code": "UK"},
+        {"name": "SpiceJet", "code": "SG"},
+    ]
+    def write_price_history(route_id, price, airline, **kw):
+        return False, "Price-history writer could not be imported"
+    def send_sns_price_alert(email, route_info, price_info):
+        return False, "SNS sender could not be imported"
+    def get_latest_price_history(route_id):
+        return {"Price": 0.0, "Airline": "N/A", "Timestamp": ""}
 
-# Page Configuration
+# ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Google Flights - Serverless Price Monitor",
+    page_title="Google Flights – Price Monitor",
     page_icon="✈️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom Styling (Google Material Design Dark Theme)
+# ── global CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main { background-color: #202124; color: #e8eaed; }
-    .stButton>button {
-        background-color: #8ab4f8; color: #202124; font-weight: 600;
-        border-radius: 24px; padding: 0.5rem 1.5rem; border: none; transition: all 0.2s ease;
-    }
-    .stButton>button:hover { background-color: #aecbfa; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
-    .card {
-        background-color: #2d2e31; border-radius: 12px; padding: 1.5rem;
-        margin-bottom: 1rem; border: 1px solid #3c4043;
-    }
-    .badge-green { background-color: #137333; color: #e6f4ea; padding: 4px 12px; border-radius: 16px; font-weight: 600; font-size: 0.85rem; }
-    .badge-yellow { background-color: #b06000; color: #fef7e0; padding: 4px 12px; border-radius: 16px; font-weight: 600; font-size: 0.85rem; }
-    .stat-box { background-color: #171717; padding: 1rem; border-radius: 8px; border-left: 4px solid #8ab4f8; }
+  html, body, [data-testid="stAppViewContainer"] { background:#202124; color:#e8eaed; }
+  [data-testid="stSidebar"] { background:#292a2d; }
+  h1,h2,h3,h4 { color:#e8eaed; }
+  .stButton>button {
+    background:#8ab4f8; color:#202124; font-weight:700;
+    border-radius:24px; padding:.45rem 1.4rem; border:none; transition:.15s;
+  }
+  .stButton>button:hover { background:#aecbfa; }
+  .flight-card {
+    background:#2d2e31; border:1px solid #3c4043; border-radius:12px;
+    padding:1rem 1.25rem; margin-bottom:.75rem;
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  .tracker-card {
+    background:#292a2d; border:1px solid #3c4043; border-radius:12px;
+    padding:1.25rem; margin-bottom:1rem;
+  }
+  .badge-green { background:#137333; color:#e6f4ea; padding:3px 10px; border-radius:12px; font-size:.8rem; font-weight:700; }
+  .badge-yellow{ background:#b06000; color:#fef7e0; padding:3px 10px; border-radius:12px; font-size:.8rem; font-weight:700; }
+  .price-big { font-size:1.6rem; font-weight:800; color:#8ab4f8; }
+  .airline-label { font-size:.9rem; color:#9aa0a6; }
+  hr { border-color:#3c4043; }
 </style>
 """, unsafe_allow_html=True)
 
-# AWS Configuration & Defaults
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+# ── constants ─────────────────────────────────────────────────────────────────
+AWS_REGION           = os.environ.get("AWS_REGION",           "us-east-1")
 TRACKED_ROUTES_TABLE = os.environ.get("TRACKED_ROUTES_TABLE", "TrackedRoutes")
-PRICE_HISTORY_TABLE = os.environ.get("PRICE_HISTORY_TABLE", "PriceHistory")
-SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:309272175061:FlightPriceAlertsTopic")
-LOCAL_STORAGE_FILE = os.path.join(os.path.dirname(__file__), "active_trackers.json")
+PRICE_HISTORY_TABLE  = os.environ.get("PRICE_HISTORY_TABLE",  "PriceHistory")
+SNS_TOPIC_ARN        = os.environ.get("SNS_TOPIC_ARN",
+    "")
+LOCAL_FILE = os.path.join(os.path.dirname(__file__), "active_trackers.json")
+logger = logging.getLogger(__name__)
 
 AIRPORTS = {
-    "TRV": "Trivandrum (TRV)",
-    "BLR": "Bengaluru (BLR)",
-    "DEL": "New Delhi (DEL)",
-    "BOM": "Mumbai (BOM)",
-    "MAA": "Chennai (MAA)",
-    "CJB": "Coimbatore (CJB)",
-    "HYD": "Hyderabad (HYD)",
-    "CCU": "Kolkata (CCU)"
+    "TRV":"Trivandrum",   "BLR":"Bengaluru",  "DEL":"New Delhi",
+    "BOM":"Mumbai",       "MAA":"Chennai",    "CJB":"Coimbatore",
+    "HYD":"Hyderabad",    "CCU":"Kolkata",
 }
 
+# base fare matrix (INR)
+BASE_FARES = {
+    ("TRV","BLR"):3200, ("BLR","TRV"):3400, ("TRV","DEL"):7200, ("DEL","TRV"):7500,
+    ("TRV","BOM"):5800, ("BOM","TRV"):6000, ("TRV","MAA"):2600, ("MAA","TRV"):2700,
+    ("CJB","MAA"):2800, ("MAA","CJB"):2900, ("BLR","DEL"):5500, ("DEL","BLR"):5700,
+    ("BOM","DEL"):4800, ("DEL","BOM"):5000, ("HYD","BLR"):3500, ("BLR","HYD"):3600,
+}
 
-def load_aws_trackers():
-    """Fetches active trackers directly from AWS DynamoDB (with local fallback)."""
+# ── helpers ───────────────────────────────────────────────────────────────────
+def to_float(x):
+    if isinstance(x, decimal.Decimal): return float(x)
+    if isinstance(x, list):  return [to_float(i) for i in x]
+    if isinstance(x, dict):  return {k: to_float(v) for k,v in x.items()}
+    return x
+
+def dynamodb_table(name):
+    return boto3.resource("dynamodb", region_name=AWS_REGION).Table(name)
+
+def load_db_trackers():
+    trackers_by_id = {
+        item["RouteId"]: to_float(item)
+        for item in load_items("trackers")
+        if item.get("RouteId")
+    }
     try:
-        dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-        table = dynamodb.Table(TRACKED_ROUTES_TABLE)
+        table = dynamodb_table(TRACKED_ROUTES_TABLE)
         res = table.scan()
-        items = res.get("Items", [])
-        if items:
-            return items
-    except Exception:
+        for item in res.get("Items", []):
+            trackers_by_id[item["RouteId"]] = to_float(item)
+        while res.get("LastEvaluatedKey"):
+            res = table.scan(ExclusiveStartKey=res["LastEvaluatedKey"])
+            for item in res.get("Items", []):
+                trackers_by_id[item["RouteId"]] = to_float(item)
+    except Exception as error:
+        logger.warning("Could not load all trackers from DynamoDB: %s", error)
+
+    try:
+        with open(LOCAL_FILE, encoding="utf-8") as local_file:
+            local_trackers = json.load(local_file)
+        for item in local_trackers:
+            if item.get("RouteId"):
+                trackers_by_id.setdefault(item["RouteId"], to_float(item))
+    except FileNotFoundError:
         pass
-    
-    if os.path.exists(LOCAL_STORAGE_FILE):
-        try:
-            with open(LOCAL_STORAGE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Could not load local trackers: %s", error)
+    return list(trackers_by_id.values())
 
-
-def save_tracker_to_aws(payload):
-    """Saves route tracker to DynamoDB and automatically executes initial price check & SNS alert."""
-    db_saved = False
+def save_tracker_db(t):
+    item = {
+        "RouteId":      t["RouteId"],
+        "UserId":       t["UserId"],
+        "email":        t["UserId"],
+        "Origin":       t["Origin"],
+        "Destination":  t["Destination"],
+        "DepartureDate":t["DepartureDate"],
+        "TargetPrice":  float(t["TargetPrice"]),
+        "CreatedAt":    t["CreatedAt"],
+    }
     try:
-        dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-        table = dynamodb.Table(TRACKED_ROUTES_TABLE)
-        db_item = {
-            "RouteId": str(payload["RouteId"]),
-            "UserId": str(payload["UserId"]),
-            "email": str(payload["UserId"]),
-            "Origin": str(payload["Origin"]),
-            "Destination": str(payload["Destination"]),
-            "DepartureDate": str(payload["DepartureDate"]),
-            "TargetPrice": float(payload["TargetPrice"]),
-            "CreatedAt": str(payload["CreatedAt"])
-        }
-        table.put_item(Item=db_item)
-        db_saved = True
-    except Exception as e:
-        trackers = load_aws_trackers()
-        trackers.append(payload)
-        with open(LOCAL_STORAGE_FILE, "w") as f:
-            json.dump(trackers, f, indent=2)
+        dynamodb_table(TRACKED_ROUTES_TABLE).put_item(Item=item)
+        database_saved = True
+    except Exception as error:
+        logger.warning("Could not save tracker to DynamoDB: %s", error)
+        database_saved = False
 
-    # Automatic background evaluation: Immediately fetch price and send SNS alert if price <= target
-    flight_data = fetch_flight_prices(payload["Origin"], payload["Destination"], payload["DepartureDate"])
-    write_price_history(payload["RouteId"], flight_data["price"], flight_data["airline"])
-    
-    alert_sent = False
-    if flight_data["price"] <= payload["TargetPrice"]:
-        alert_sent, _ = send_sns_price_alert(payload["UserId"], payload, flight_data)
-        
-    return db_saved, flight_data, alert_sent
+    existing = load_db_trackers()
+    by_id = {tracker.get("RouteId"): tracker for tracker in existing}
+    by_id[item["RouteId"]] = item
+    save_items("trackers", list(by_id.values()))
+    with open(LOCAL_FILE, "w", encoding="utf-8") as local_file:
+        json.dump(list(by_id.values()), local_file, indent=2)
+    return database_saved
 
+def mock_flights(origin, dest, date_str):
+    """Generate realistic mock flight options for a route."""
+    base = BASE_FARES.get((origin, dest), 5000)
+    random.seed(f"{origin}{dest}{date_str}")
+    results = []
+    deps = ["06:10","08:45","11:30","14:15","17:50","20:05"]
+    durs = ["1h 15m","2h 05m","1h 50m","2h 30m","1h 25m","2h 10m"]
+    for i, al in enumerate(AIRLINES):
+        var   = random.uniform(0.82, 1.22)
+        price = round(base * var / 50) * 50
+        dep   = deps[i % len(deps)]
+        hr,mn = map(int, dep.split(":"))
+        dur_m = random.randint(65, 145)
+        arr_t = datetime.datetime(2024, 1, 1, hr, mn) + datetime.timedelta(minutes=dur_m)
+        results.append({
+            "airline":  al["name"],
+            "code":     al["code"],
+            "price":    price,
+            "dep":      dep,
+            "arr":      arr_t.strftime("%H:%M"),
+            "duration": f"{dur_m//60}h {dur_m%60:02d}m",
+            "stops":    "Non-stop" if dur_m < 100 else "1 Stop",
+        })
+    return sorted(results, key=lambda x: x["price"])
 
-def query_price_history(route_id):
-    """Retrieves all historical price observations for a route from DynamoDB."""
+def query_price_history_df(route_id):
     try:
-        dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-        table = dynamodb.Table(PRICE_HISTORY_TABLE)
         from boto3.dynamodb.conditions import Key
-        response = table.query(
+        res = dynamodb_table(PRICE_HISTORY_TABLE).query(
             KeyConditionExpression=Key("RouteId").eq(str(route_id))
         )
-        items = response.get("Items", [])
+        items = to_float(res.get("Items", []))
+        local_items = [
+            item for item in load_items("price_history")
+            if item.get("RouteId") == str(route_id)
+        ]
+        items.extend(local_items)
         if items:
+            items = list({
+                (item["RouteId"], item["Timestamp"]): item for item in items
+            }.values())
             df = pd.DataFrame(items)
-            df["Price"] = df["Price"].astype(float)
+            df["Price"]     = df["Price"].astype(float)
             df["Timestamp"] = pd.to_datetime(df["Timestamp"])
             return df.sort_values("Timestamp")
-    except Exception:
-        pass
-    
-    # Fallback mock price history series for chart visualization
-    now = datetime.datetime.now(datetime.timezone.utc)
-    timestamps = [now - datetime.timedelta(hours=i*6) for i in range(5, -1, -1)]
-    base = 5200.0 if route_id == "TRK-001" else 3100.0
-    prices = [base + random.randint(-400, 300) for _ in range(6)]
-    return pd.DataFrame({
-        "Timestamp": timestamps,
-        "Price": prices,
-        "Airline": ["IndiGo", "SpiceJet", "Air India", "Akasa Air", "Vistara", "IndiGo"]
-    })
+    except Exception as error:
+        logger.warning("Could not query price history for %s: %s", route_id, error)
+    items = [item for item in load_items("price_history") if item.get("RouteId") == str(route_id)]
+    if items:
+        df = pd.DataFrame(items)
+        df["Price"] = df["Price"].astype(float)
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+        return df.sort_values("Timestamp")
+    return pd.DataFrame(columns=["Timestamp", "Price"])
+
+def evaluate_and_alert(tracker, current_price, airline):
+    target = float(tracker["TargetPrice"])
+    if current_price <= target:
+        route_info = {
+            "RouteId":      tracker["RouteId"],
+            "Origin":       tracker["Origin"],
+            "Destination":  tracker["Destination"],
+            "DepartureDate":tracker["DepartureDate"],
+            "TargetPrice":  target,
+        }
+        price_info = {
+            "RouteId":   tracker["RouteId"],
+            "Price":     current_price,
+            "Airline":   airline,
+            "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        sent, _ = send_sns_price_alert(tracker["UserId"], route_info, price_info)
+        return sent
+    return False
 
 
-# Sidebar Navigation & Status
-st.sidebar.image("https://www.gstatic.com/images/branding/product/2x/google_flights_64dp.png", width=48)
-st.sidebar.title("Flight Price Intelligence")
-st.sidebar.caption("Serverless Cloud System")
-st.sidebar.markdown("---")
-st.sidebar.markdown(f"**AWS Region:** `{AWS_REGION}`")
-st.sidebar.markdown(f"**DynamoDB Status:** `ACTIVE` 🟢")
-st.sidebar.markdown(f"**SNS Email Topic:** `Connected` 📩")
+def require_authentication():
+    if st.session_state.get("authenticated"):
+        return
 
-st.title("✈️ Google Flights - Serverless Price Monitor")
-st.caption("Real-Time Flight Fare Ingestion & Automated SNS Price Drop Notifications")
+    st.title("Flight Monitor sign in")
+    st.caption("Sign in to view and manage tracked routes.")
+    with st.form("login_form"):
+        password = st.text_input("Application password", type="password")
+        submitted = st.form_submit_button("Sign in")
+
+    if submitted:
+        secret_arn = os.environ.get("APP_PASSWORD_SECRET_ARN")
+        if not secret_arn:
+            st.error("Application password is not configured. Contact the administrator.")
+        else:
+            try:
+                secret = boto3.client(
+                    "secretsmanager", region_name=AWS_REGION
+                ).get_secret_value(SecretId=secret_arn)["SecretString"]
+            except Exception:
+                logger.exception("Could not read the application password from Secrets Manager")
+                st.error("Sign in is temporarily unavailable. Check the application configuration.")
+            else:
+                if hmac.compare_digest(password, secret):
+                    st.session_state["authenticated"] = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password.")
+    st.stop()
+
+
+require_authentication()
+
+# ── session_state bootstrap ───────────────────────────────────────────────────
+if "trackers" not in st.session_state:
+    st.session_state["trackers"] = load_db_trackers()
+if "search_results" not in st.session_state:
+    st.session_state["search_results"] = None
+if "search_meta" not in st.session_state:
+    st.session_state["search_meta"] = {}
+
+# ── sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.image("https://www.gstatic.com/images/branding/product/2x/google_flights_64dp.png", width=48)
+    st.markdown("## ✈️ Flight Monitor")
+    st.caption("Serverless AWS Price Alerts")
+    st.markdown("---")
+    n = len(st.session_state["trackers"])
+    st.metric("Active Trackers", n)
+    st.markdown(f"**AWS Region:** `{AWS_REGION}`")
+    st.markdown(
+        "**SNS Topic:** `Configured` 🟢" if SNS_TOPIC_ARN
+        else "**SNS Topic:** `Not configured` 🔴"
+    )
+    if st.button("Sign out"):
+        st.session_state["authenticated"] = False
+        st.rerun()
+    if st.button("🔄 Sync Trackers"):
+        st.session_state["trackers"] = load_db_trackers()
+        st.toast("Refreshed trackers from DynamoDB and local storage.")
+
+# ── main title ────────────────────────────────────────────────────────────────
+st.markdown("# ✈️ Google Flights – Price Drop Monitor")
+st.caption("Search flights · Set alerts · Get notified automatically via email")
+st.markdown("---")
 
 tab1, tab2, tab3 = st.tabs([
-    "✈️ Set Price Alert", 
-    "📊 Active Trackers & Price Trends", 
-    "⚡ Data Ingestion Studio"
+    "🔍 Search Flights",
+    f"🔔 My Trackers ({len(st.session_state['trackers'])})",
+    "⚡ Mock Data Injector",
 ])
 
-# TAB 1: Automatic User Tracker Form
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 – Search Flights & Set Tracker
+# ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.subheader("Create Automated Flight Price Alert")
-    st.markdown("Set your route preferences below. When we detect airfares dropping below your target price, an automated email notification will be sent immediately via Amazon SNS.")
-    
-    with st.form("tracker_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            user_email = st.text_input("Notification Email", value="adwaitharun2005@gmail.com", help="Email to receive price drop alerts")
-            origin_code = st.selectbox("Origin Airport", list(AIRPORTS.keys()), index=0, format_func=lambda x: AIRPORTS[x])
-            departure_date = st.date_input("Departure Date", value=datetime.date.today() + datetime.timedelta(days=14))
-        
-        with col2:
-            target_price = st.number_input("Target Fare Threshold (₹ INR)", min_value=500, max_value=50000, value=5000, step=250)
-            dest_code = st.selectbox("Destination Airport", list(AIRPORTS.keys()), index=1, format_func=lambda x: AIRPORTS[x])
-        
-        submit_btn = st.form_submit_button("🔔 Start Automatic Monitoring", use_container_width=True)
+    st.subheader("Search Flights")
 
-    if submit_btn:
-        if origin_code == dest_code:
-            st.error("⚠️ Origin and Destination airports cannot be identical!")
-        else:
-            with st.spinner("Registering route and running initial fare check..."):
-                route_id = f"TRK-{uuid.uuid4().hex[:8].upper()}"
-                payload = {
-                    "RouteId": route_id,
-                    "UserId": user_email,
-                    "Origin": origin_code,
-                    "Destination": dest_code,
-                    "DepartureDate": str(departure_date),
-                    "TargetPrice": float(target_price),
-                    "CreatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                }
-                
-                db_saved, flight_data, alert_sent = save_tracker_to_aws(payload)
-                
-                st.success("✅ Flight Tracker Created & Active in Cloud System!")
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Observed Current Price", f"₹{flight_data['price']:,.2f}", delta=f"₹{flight_data['price'] - target_price:,.2f}")
-                c2.metric("Target Threshold", f"₹{target_price:,.2f}")
-                c3.metric("Operating Airline", flight_data["airline"])
-                
-                if alert_sent:
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+    with c1:
+        origin = st.selectbox("From", list(AIRPORTS.keys()),
+                              format_func=lambda x: f"{x} – {AIRPORTS[x]}")
+    with c2:
+        dest_opts = [k for k in AIRPORTS if k != origin]
+        dest = st.selectbox("To", dest_opts,
+                            format_func=lambda x: f"{x} – {AIRPORTS[x]}")
+    with c3:
+        dep_date = st.date_input("Departure", value=datetime.date.today() + datetime.timedelta(days=14))
+    with c4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        search_clicked = st.button("🔍 Search", use_container_width=True)
+
+    if search_clicked:
+        with st.spinner("Searching available flights..."):
+            flights = mock_flights(origin, dest, str(dep_date))
+            st.session_state["search_results"] = flights
+            st.session_state["search_meta"] = {
+                "origin": origin, "dest": dest, "date": str(dep_date)
+            }
+
+    results = st.session_state["search_results"]
+    meta    = st.session_state["search_meta"]
+
+    if results:
+        o, d = meta["origin"], meta["dest"]
+        st.markdown(f"### {AIRPORTS[o]} ({o}) &nbsp;→&nbsp; {AIRPORTS[d]} ({d}) &nbsp;·&nbsp; {meta['date']}")
+        st.caption(f"{len(results)} flights found · Prices in ₹ INR")
+        st.markdown("---")
+
+        for fl in results:
+            with st.container():
+                col_al, col_time, col_type, col_price, col_btn = st.columns([2, 2.5, 1.5, 2, 1.5])
+                with col_al:
+                    st.markdown(f"**{fl['airline']}** `{fl['code']}`")
+                with col_time:
+                    st.markdown(f"🛫 `{fl['dep']}`  →  🛬 `{fl['arr']}`")
+                    st.caption(fl["duration"])
+                with col_type:
+                    st.markdown(fl["stops"])
+                with col_price:
+                    st.markdown(f"<span class='price-big'>₹{fl['price']:,}</span>", unsafe_allow_html=True)
+                with col_btn:
+                    if st.button("🔔 Alert me", key=f"alert_{fl['airline']}_{fl['price']}"):
+                        st.session_state["prefill_price"] = fl["price"]
+                        st.session_state["prefill_airline"] = fl["airline"]
+
+            st.markdown("<hr style='margin:.25rem 0; border-color:#3c4043'>", unsafe_allow_html=True)
+
+        st.markdown("---")
+        # ── Set Price Alert form ───────────────────────────────────────────────
+        st.subheader("🔔 Set a Price Drop Alert for this Route")
+        st.caption("We'll automatically email you the moment fares fall below your target price.")
+
+        prefill_price = st.session_state.get("prefill_price", results[0]["price"])
+
+        with st.form("alert_form"):
+            fa, fb = st.columns(2)
+            with fa:
+                alert_email = st.text_input("Your email", value="adwaitharun2005@gmail.com")
+                alert_price = st.number_input(
+                    "Target price threshold (₹)",
+                    min_value=500, max_value=50000,
+                    value=int(prefill_price), step=250,
+                    help="You'll be alerted when any fare hits this price or lower."
+                )
+            with fb:
+                st.markdown(f"**Route:** `{o}` → `{d}`")
+                st.markdown(f"**Date:** `{meta['date']}`")
+                st.markdown(f"**Cheapest fare right now:** ₹{results[0]['price']:,} ({results[0]['airline']})")
+
+            track_btn = st.form_submit_button("🚀 Start Tracking", use_container_width=True)
+
+        if track_btn:
+            route_id = f"TRK-{uuid.uuid4().hex[:8].upper()}"
+            now_str  = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tracker  = {
+                "RouteId":      route_id,
+                "UserId":       alert_email,
+                "Origin":       o,
+                "Destination":  d,
+                "DepartureDate":meta["date"],
+                "TargetPrice":  float(alert_price),
+                "CreatedAt":    now_str,
+            }
+
+            # save to DynamoDB and local state
+            database_saved = save_tracker_db(tracker)
+            st.session_state["trackers"] = load_db_trackers()
+
+            # check immediately if cheapest fare already meets target
+            cheapest = results[0]
+            write_price_history(route_id, cheapest["price"], cheapest["airline"])
+
+            st.success(f"✅ Tracker active! Monitoring `{o} → {d}` for fares ≤ ₹{alert_price:,}")
+            if not database_saved:
+                st.warning("AWS is unavailable; this tracker was saved locally on this app server.")
+            if cheapest["price"] <= alert_price:
+                sent = evaluate_and_alert(tracker, cheapest["price"], cheapest["airline"])
+                if sent:
                     st.balloons()
-                    st.success("🎉 **Price Drop Alert Sent!** Current fare is below your target. Check your email (`adwaitharun2005@gmail.com`).")
+                    st.success(f"🎉 Alert sent immediately! Current fare ₹{cheapest['price']:,} is already below your target. Check `{alert_email}`.")
                 else:
-                    st.info("👀 Currently monitoring. If fares drop below your target price, an automated SNS alert will be sent to your email.")
+                    st.warning("The email was not sent. Confirm the SNS email subscription and check SNS_TOPIC_ARN.")
+            else:
+                st.info(f"👀 Current cheapest fare is ₹{cheapest['price']:,}. You'll be emailed when it drops to ₹{alert_price:,} or below.")
 
-
-# TAB 2: Dashboard & Price Trend Graphs
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 – My Trackers
+# ══════════════════════════════════════════════════════════════════════════════
 with tab2:
-    st.subheader("Active Trackers & Fare Analytics")
-    trackers = load_aws_trackers()
-    
+    trackers = st.session_state["trackers"]
+    st.subheader(f"My Active Trackers  ({len(trackers)})")
+
     if not trackers:
-        st.warning("No active route trackers found. Set a price alert in the first tab!")
+        st.info("No trackers yet. Search a route in the first tab and hit **Start Tracking**.")
     else:
-        st.write(f"Monitoring **{len(trackers)}** Active Route Trackers:")
-        
-        for tracker in trackers:
-            route_id = tracker.get("RouteId", "N/A")
-            origin = tracker.get("Origin", "N/A")
-            dest = tracker.get("Destination", "N/A")
-            target = float(tracker.get("TargetPrice", 0))
-            email = tracker.get("UserId", tracker.get("email", "N/A"))
-            dep_date = tracker.get("DepartureDate", "N/A")
-            
-            latest_info = get_latest_price_history(route_id)
-            curr_price = latest_info.get("Price", 0)
-            airline = latest_info.get("Airline", "Airline")
-            
-            with st.expander(f"✈️ {origin} ➔ {dest} | Current: ₹{curr_price:,.2f} | Target: ₹{target:,.2f}", expanded=True):
-                col_info, col_chart = st.columns([1, 2])
-                
-                with col_info:
+        for i, t in enumerate(trackers):
+            route_id  = t.get("RouteId", "N/A")
+            origin    = t.get("Origin",      "?")
+            dest      = t.get("Destination", "?")
+            target    = float(t.get("TargetPrice", 0))
+            email     = t.get("UserId", t.get("email", "?"))
+            dep_date  = t.get("DepartureDate", "?")
+
+            latest    = get_latest_price_history(route_id)
+            curr      = float(latest.get("Price", 0) or 0)
+            airline   = latest.get("Airline", "—")
+            met       = curr > 0 and curr <= target
+
+            with st.expander(
+                f"✈️  {origin} → {dest}   |   Target ₹{target:,.0f}   |   "
+                f"{'🎯 TARGET MET' if met else '👀 Monitoring'}",
+                expanded=True
+            ):
+                left, right = st.columns([1, 2])
+                with left:
                     st.markdown(f"**Route ID:** `{route_id}`")
-                    st.markdown(f"**Departure Date:** {dep_date}")
-                    st.markdown(f"**Alert Email:** `{email}`")
-                    st.markdown(f"**Operating Airline:** {airline}")
-                    
-                    if curr_price <= target:
-                        st.markdown("<span class='badge-green'>🎯 TARGET PRICE MET</span>", unsafe_allow_html=True)
+                    st.markdown(f"**Departure:** {dep_date}")
+                    st.markdown(f"**Alert email:** `{email}`")
+                    if curr > 0:
+                        st.markdown(f"**Latest Fare:** ₹{curr:,.2f} ({airline})")
+                        if met:
+                            st.markdown("<span class='badge-green'>🎯 TARGET PRICE MET</span>", unsafe_allow_html=True)
+                        else:
+                            diff = curr - target
+                            st.markdown(f"<span class='badge-yellow'>₹{diff:,.0f} above target</span>", unsafe_allow_html=True)
                     else:
-                        st.markdown("<span class='badge-yellow'>👀 MONITORING FARES</span>", unsafe_allow_html=True)
-                
-                with col_chart:
-                    df_history = query_price_history(route_id)
-                    st.caption("Price History Trend (DynamoDB Ledger)")
-                    st.line_chart(df_history.set_index("Timestamp")["Price"])
+                        st.markdown("*No price data yet – inject data in Tab 3*")
 
+                    if st.button("📩 Check & Alert Now", key=f"check_{route_id}"):
+                        latest2  = get_latest_price_history(route_id)
+                        curr2    = float(latest2.get("Price", 0) or 0)
+                        airline2 = latest2.get("Airline", "—")
+                        if curr2 > 0 and curr2 <= target:
+                            sent = evaluate_and_alert(t, curr2, airline2)
+                            if sent:
+                                st.success(f"📩 Alert sent! ₹{curr2:,} ≤ ₹{target:,} — email dispatched to `{email}`")
+                            else:
+                                st.warning("Alert trigger failed. Check SNS configuration.")
+                        else:
+                            st.info(f"Fare ₹{curr2:,} is still above target ₹{target:,}. No alert needed yet.")
 
-# TAB 3: Batch Data Ingestion Studio
+                with right:
+                    df = query_price_history_df(route_id)
+                    st.caption("Price history")
+                    st.line_chart(df.set_index("Timestamp")["Price"], height=160)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 – Mock Data Injector
+# ══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.subheader("⚡ Data Ingestion Studio")
-    st.markdown("Ingest diverse flight pricing datasets into the `PriceHistory` DynamoDB table and trigger bulk evaluations.")
-    
-    col_ingest1, col_ingest2 = st.columns(2)
-    
-    with col_ingest1:
-        st.markdown("### 1. Multi-Route Batch Ingestion")
-        st.caption("Simulate scheduled ingestion by pulling live/mock fares for all tracked routes.")
-        
-        if st.button("🔄 Execute Batch Route Ingestion", use_container_width=True):
-            with st.spinner("Ingesting flight fares across all routes..."):
-                from src.api_fetcher.fetcher import lambda_handler
-                res = lambda_handler({}, None)
-                body = json.loads(res["body"])
-                st.success(f"✅ Batch Ingestion Completed! Ingested fares for {len(body.get('processed_records', []))} routes.")
-                st.dataframe(pd.DataFrame(body.get("processed_records", [])))
+    st.subheader("⚡ Mock Data Injector")
+    st.markdown(
+        "Simulate flight prices and inject them into the selected route's price history. "
+        "A matching fare triggers an email alert if the route's SNS email subscription is confirmed."
+    )
 
-    with col_ingest2:
-        st.markdown("### 2. Custom Airline Data Injection")
-        st.caption("Manually inject custom price observations for specific airlines into DynamoDB.")
-        
-        with st.form("custom_ingest_form"):
-            inj_route = st.selectbox("Select Route to Update", [t.get("RouteId") for t in trackers] if trackers else ["TRK-001"])
-            inj_airline = st.selectbox("Airline", [a["name"] for a in AIRLINES])
-            inj_price = st.number_input("Observed Flight Price (₹)", min_value=1000, max_value=35000, value=3800, step=200)
-            
-            inj_submit = st.form_submit_button("💉 Inject Custom Price Record", use_container_width=True)
-            if inj_submit:
-                write_price_history(inj_route, inj_price, inj_airline)
-                st.success(f"✅ Injected ₹{inj_price:,} ({inj_airline}) for Route {inj_route} into DynamoDB!")
+    trackers_now = st.session_state["trackers"]
+
+    # ── quick injector ─────────────────────────────────────────────────────────
+    st.markdown("### 1. Inject Flights into a Tracked Route")
+    if not trackers_now:
+        st.warning("Create at least one tracker first (Tab 1).")
+    else:
+        route_labels = {
+            t["RouteId"]: f"{t['Origin']} → {t['Destination']}  ({t['RouteId']})"
+            for t in trackers_now
+        }
+        sel_id = st.selectbox("Select Tracker / Route", list(route_labels.keys()),
+                              format_func=lambda x: route_labels[x])
+        sel_t  = next(t for t in trackers_now if t["RouteId"] == sel_id)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            inj_airlines = st.multiselect(
+                "Airlines to include",
+                [a["name"] for a in AIRLINES],
+                default=[a["name"] for a in AIRLINES],
+            )
+        with col_b:
+            pmin = st.number_input("Min price (₹)", min_value=500, max_value=20000, value=2500, step=500)
+            pmax = st.number_input("Max price (₹)", min_value=1000, max_value=50000, value=7000, step=500)
+        with col_c:
+            n_records = st.slider("Number of records", 3, 30, 8)
+            spread_hours = st.slider("Time spread (hours back)", 6, 72, 24)
+
+        if st.button("🚀 Generate & Inject Records", use_container_width=True):
+            if not inj_airlines:
+                st.error("Select at least one airline.")
+            elif pmin >= pmax:
+                st.error("Min price must be less than Max price.")
+            else:
+                injected = []
+                now_utc  = datetime.datetime.now(datetime.timezone.utc)
+                latest = get_latest_price_history(sel_id)
+                now_utc = now_utc.replace(microsecond=0)
+                try:
+                    latest_timestamp = datetime.datetime.fromisoformat(
+                        latest.get("Timestamp", "").replace("Z", "+00:00")
+                    ).astimezone(datetime.timezone.utc).replace(microsecond=0)
+                    end_utc = max(now_utc, latest_timestamp + datetime.timedelta(seconds=1))
+                except (ValueError, TypeError):
+                    end_utc = now_utc
+
+                start_utc = end_utc - datetime.timedelta(hours=spread_hours)
+                injected_ok = 0
+                for i in range(n_records):
+                    al    = random.choice(inj_airlines)
+                    price = random.randint(int(pmin), int(pmax))
+                    fraction = i / max(n_records - 1, 1)
+                    ts = start_utc + (end_utc - start_utc) * fraction
+                    ts_str= ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    saved, _ = write_price_history(sel_id, price, al, timestamp=ts_str)
+                    if saved:
+                        injected_ok += 1
+                    injected.append({"Airline": al, "Price": price, "Timestamp": ts_str})
+
+                if injected_ok == n_records:
+                    st.success(f"✅ Injected {n_records} price records for `{sel_id}`!")
+                else:
+                    st.error(f"Only {injected_ok} of {n_records} price records were saved. Check AWS table access.")
+                st.dataframe(
+                    pd.DataFrame(sorted(injected, key=lambda x: x["Price"])),
+                    use_container_width=True
+                )
+
+                # Evaluate the route receiving this batch, not unrelated routes.
+                st.markdown("#### 🔍 Auto-evaluating this tracker...")
+                alerts_sent = 0
+                latest = get_latest_price_history(sel_id)
+                cp = float(latest.get("Price", 0) or 0)
+                al_name = latest.get("Airline", "—")
+                if cp > 0 and cp <= float(sel_t["TargetPrice"]):
+                    sent = evaluate_and_alert(sel_t, cp, al_name)
+                    if sent:
+                        alerts_sent += 1
+                        st.success(
+                            f"📩 **Alert sent** · `{sel_t['Origin']}→{sel_t['Destination']}` · "
+                            f"₹{cp:,} ≤ target ₹{sel_t['TargetPrice']:,} · → `{sel_t['UserId']}`"
+                        )
+                    else:
+                        st.warning(
+                            "The fare met this tracker, but no email was sent. Confirm the SNS "
+                            "subscription email in the tracker inbox and configure SNS_TOPIC_ARN."
+                        )
+
+                if alerts_sent == 0:
+                    if cp > float(sel_t["TargetPrice"]):
+                        st.info("The latest fare is above this tracker's target. Try injecting a lower price.")
+                else:
+                    st.balloons()
 
     st.markdown("---")
-    st.markdown("### 3. Bulk SNS Price Alert Evaluator")
-    if st.button("📩 Execute Event-Driven Alert Engine", use_container_width=True):
-        with st.spinner("Evaluating all routes against target thresholds..."):
-            from src.processor.alert_engine import lambda_handler as alert_handler
-            res = alert_handler({}, None)
-            body = json.loads(res["body"])
-            st.success(f"✅ Alert Engine Executed! ({body.get('alerts_triggered_count', 0)} SNS email alerts published)")
-            st.json(body)
+
+    # ── bulk seed all routes ───────────────────────────────────────────────────
+    st.markdown("### 2. Seed All Tracked Routes at Once")
+    st.caption("Injects one random fare record per route for every active tracker.")
+    if st.button("🌐 Seed All Routes with Random Fares", use_container_width=True):
+        if not trackers_now:
+            st.warning("No trackers found.")
+        else:
+            for t in trackers_now:
+                base  = BASE_FARES.get((t["Origin"], t["Destination"]), 5000)
+                price = round(base * random.uniform(0.80, 1.25) / 50) * 50
+                al    = random.choice(AIRLINES)["name"]
+                saved, error = write_price_history(t["RouteId"], price, al)
+                if not saved:
+                    st.error(f"Could not save fare for `{t['RouteId']}`: {error}")
+                    continue
+                st.write(f"&nbsp;&nbsp;✅ `{t['RouteId']}` ({t['Origin']}→{t['Destination']}) – ₹{price:,} ({al})")
+            st.success("Seeded all routes. Switch to **My Trackers** tab to see updated prices.")
 
 st.markdown("---")
-st.caption("Cloud-Based Flight Price Monitoring System • AWS Serverless Architecture (DynamoDB, Lambda, SNS, EventBridge)")
+st.caption("Cloud-Based Flight Price Monitoring · AWS (DynamoDB · SNS · Lambda · EventBridge)")

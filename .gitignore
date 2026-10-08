@@ -36,6 +36,8 @@ ENV/
 .ruff_cache/
 .coverage
 htmlcov/
+build/aws/
+src/database/local_data.json
 
 # IDE and OS files
 .vscode/

@@ -4,9 +4,11 @@ import random
 import datetime
 import decimal
 import logging
-import requests
 import boto3
 from botocore.exceptions import ClientError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from src.database.local_store import add_price_record, load_items
 
 # Set up logging
 logger = logging.getLogger()
@@ -42,9 +44,9 @@ def get_amadeus_access_token():
     }
     
     try:
-        response = requests.post(url, headers=headers, data=data, timeout=5)
-        if response.status_code == 200:
-            return response.json().get("access_token")
+        request = Request(url, data=urlencode(data).encode(), headers=headers)
+        with urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode()).get("access_token")
     except Exception as e:
         logger.warning(f"Failed to obtain Amadeus token: {e}")
     return None
@@ -106,22 +108,25 @@ def fetch_flight_prices(origin, destination, departure_date):
             "max": 5
         }
         try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            if res.status_code == 200:
-                data = res.json().get("data", [])
-                if data:
-                    cheapest = min(data, key=lambda x: float(x["price"]["total"]))
-                    price_val = float(cheapest["price"]["total"])
-                    valid_airline = AIRLINES[0]["name"]
-                    return {
-                        "origin": origin.upper(),
-                        "destination": destination.upper(),
-                        "departure_date": departure_date,
-                        "price": price_val,
-                        "airline": valid_airline,
-                        "currency": "INR",
-                        "is_mock": False
-                    }
+            request = Request(
+                f"{url}?{urlencode(params)}",
+                headers=headers,
+            )
+            with urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode()).get("data", [])
+            if data:
+                cheapest = min(data, key=lambda x: float(x["price"]["total"]))
+                price_val = float(cheapest["price"]["total"])
+                valid_airline = AIRLINES[0]["name"]
+                return {
+                    "origin": origin.upper(),
+                    "destination": destination.upper(),
+                    "departure_date": departure_date,
+                    "price": price_val,
+                    "airline": valid_airline,
+                    "currency": "INR",
+                    "is_mock": False
+                }
         except Exception as e:
             logger.warning(f"Amadeus API call failed: {e}. Falling back to dynamic mock generator.")
     
@@ -159,8 +164,17 @@ def write_price_history(route_id, price, airline, timestamp=None, table_name=Non
         logger.error(f"DynamoDB ClientError writing to {table_name}: {e}")
         return False, str(e)
     except Exception as e:
-        logger.info(f"DynamoDB offline/local mode: Mocked write for item {item}")
-        return True, item
+        try:
+            local_item = {
+                **item,
+                "Price": float(item["Price"]),
+            }
+            add_price_record(local_item)
+            logger.warning(f"DynamoDB unavailable; saved price history locally: {e}")
+            return True, local_item
+        except Exception as local_error:
+            logger.exception("Could not persist price history locally")
+            return False, str(local_error)
 
 
 def scan_tracked_routes():
@@ -168,29 +182,21 @@ def scan_tracked_routes():
     try:
         dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
         table = dynamodb.Table(TRACKED_ROUTES_TABLE)
+        items = []
         response = table.scan()
-        return response.get("Items", [])
+        items.extend(response.get("Items", []))
+        while response.get("LastEvaluatedKey"):
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+        by_id = {
+            item["RouteId"]: item for item in load_items("trackers")
+            if item.get("RouteId")
+        }
+        by_id.update({item["RouteId"]: item for item in items})
+        return list(by_id.values())
     except Exception as e:
-        logger.warning(f"Could not scan DynamoDB TrackedRoutes table ({e}). Using local/mock routes if present.")
-        # Return fallback mock sample routes for local testing
-        return [
-            {
-                "RouteId": "TRK-001",
-                "UserId": "adwaitharun2005@gmail.com",
-                "Origin": "TRV",
-                "Destination": "BLR",
-                "DepartureDate": "2026-10-17",
-                "TargetPrice": 5000
-            },
-            {
-                "RouteId": "TRK-002",
-                "UserId": "adwaitharun2005@gmail.com",
-                "Origin": "CJB",
-                "Destination": "MAA",
-                "DepartureDate": "2026-10-20",
-                "TargetPrice": 3500
-            }
-        ]
+        logger.warning(f"Could not scan DynamoDB TrackedRoutes table: {e}")
+        return load_items("trackers")
 
 
 def lambda_handler(event, context):

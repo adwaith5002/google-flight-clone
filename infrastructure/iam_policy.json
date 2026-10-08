@@ -25,6 +25,8 @@
       "Action": [
         "sns:CreateTopic",
         "sns:Subscribe",
+        "sns:ListSubscriptionsByTopic",
+        "sns:SetSubscriptionAttributes",
         "sns:Publish",
         "sns:GetTopicAttributes"
       ],
