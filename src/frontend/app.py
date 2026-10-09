@@ -6,12 +6,13 @@ End-to-end Streamlit app:
   Tab 3 – Mock Data Injector (seed PriceHistory and fire SNS alerts)
 """
 
-import sys, os, json, uuid, datetime, random, decimal, logging, hmac
+import sys, os, json, uuid, datetime, random, decimal, logging
 import pandas as pd
 import streamlit as st
 import boto3
 from botocore.exceptions import ClientError
 from src.database.local_store import load_items, save_items
+import src.frontend.auth as auth
 
 # ── path so we can import fetcher / alert_engine ──────────────────────────────
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -234,38 +235,13 @@ def evaluate_and_alert(tracker, current_price, airline):
     return False
 
 
-def require_authentication():
-    if st.session_state.get("authenticated"):
-        return
 
-    st.title("Flight Monitor sign in")
-    st.caption("Sign in to view and manage tracked routes.")
-    with st.form("login_form"):
-        password = st.text_input("Application password", type="password")
-        submitted = st.form_submit_button("Sign in")
-
-    if submitted:
-        secret_arn = os.environ.get("APP_PASSWORD_SECRET_ARN")
-        if not secret_arn:
-            st.error("Application password is not configured. Contact the administrator.")
-        else:
-            try:
-                secret = boto3.client(
-                    "secretsmanager", region_name=AWS_REGION
-                ).get_secret_value(SecretId=secret_arn)["SecretString"]
-            except Exception:
-                logger.exception("Could not read the application password from Secrets Manager")
-                st.error("Sign in is temporarily unavailable. Check the application configuration.")
-            else:
-                if hmac.compare_digest(password, secret):
-                    st.session_state["authenticated"] = True
-                    st.rerun()
-                else:
-                    st.error("Incorrect password.")
-    st.stop()
+# ── Authentication gate ───────────────────────────────────────────────────────
+# show_auth_page() renders Login / Register and calls st.stop() if not logged in.
+# Nothing below this line executes until the user is authenticated.
+auth.show_auth_page()
 
 
-require_authentication()
 
 # ── session_state bootstrap ───────────────────────────────────────────────────
 if "trackers" not in st.session_state:
@@ -281,6 +257,14 @@ with st.sidebar:
     st.markdown("## ✈️ Flight Monitor")
     st.caption("Serverless AWS Price Alerts")
     st.markdown("---")
+
+    # Show who is logged in
+    user = auth.current_user()
+    if user:
+        st.markdown(f"👤 **{user['DisplayName']}**")
+        st.caption(user["Email"])
+        st.markdown("---")
+
     n = len(st.session_state["trackers"])
     st.metric("Active Trackers", n)
     st.markdown(f"**AWS Region:** `{AWS_REGION}`")
@@ -289,11 +273,11 @@ with st.sidebar:
         else "**SNS Topic:** `Not configured` 🔴"
     )
     if st.button("Sign out"):
-        st.session_state["authenticated"] = False
-        st.rerun()
+        auth.logout()
     if st.button("🔄 Sync Trackers"):
         st.session_state["trackers"] = load_db_trackers()
         st.toast("Refreshed trackers from DynamoDB and local storage.")
+
 
 # ── main title ────────────────────────────────────────────────────────────────
 st.markdown("# ✈️ Google Flights – Price Drop Monitor")
@@ -372,7 +356,13 @@ with tab1:
         with st.form("alert_form"):
             fa, fb = st.columns(2)
             with fa:
-                alert_email = st.text_input("Your email", value="adwaitharun2005@gmail.com")
+                _current_user = auth.current_user()
+                alert_email = st.text_input(
+                    "Your email",
+                    value=_current_user["Email"] if _current_user else "",
+                    disabled=bool(_current_user),   # locked to logged-in user
+                    help="Alerts will be sent to the email you signed up with.",
+                )
                 alert_price = st.number_input(
                     "Target price threshold (₹)",
                     min_value=500, max_value=50000,
