@@ -27,11 +27,16 @@ jobs:
     - name: Code Syntax & Compilation Check
       run: |
         python -m py_compile src/frontend/app.py
+        python -m py_compile src/frontend/auth.py
         python -m py_compile src/api_fetcher/fetcher.py
         python -m py_compile src/processor/alert_engine.py
+        python -m py_compile src/database/auth_store.py
         python -m py_compile infrastructure/setup_aws_infrastructure.py
 
     - name: Execute Component Test Suites
+      env:
+        PYTHONPATH: ${{ github.workspace }}
       run: |
         python src/api_fetcher/fetcher.py
         python src/processor/alert_engine.py
+
