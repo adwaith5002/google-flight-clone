@@ -55,3 +55,52 @@ def latest_price_record(route_id):
     if not records:
         return None
     return max(records, key=lambda record: record.get("Timestamp", ""))
+
+
+# ---------------------------------------------------------------------------
+# Tracker Lifecycle Functions (Edit, Pause/Resume, Delete)
+# ---------------------------------------------------------------------------
+
+def update_tracker_status(route_id: str, new_status: str) -> bool:
+    """
+    Update the status of a tracker ('Active' or 'Paused').
+    """
+    trackers = load_items("trackers")
+    updated = False
+    for t in trackers:
+        if t.get("RouteId") == str(route_id):
+            t["Status"] = new_status
+            updated = True
+            break
+    if updated:
+        save_items("trackers", trackers)
+    return updated
+
+
+def update_tracker_target_price(route_id: str, new_target_price: float) -> bool:
+    """
+    Update the target price threshold for a tracker.
+    """
+    trackers = load_items("trackers")
+    updated = False
+    for t in trackers:
+        if t.get("RouteId") == str(route_id):
+            t["TargetPrice"] = float(new_target_price)
+            updated = True
+            break
+    if updated:
+        save_items("trackers", trackers)
+    return updated
+
+
+def delete_tracker(route_id: str) -> bool:
+    """
+    Delete a tracker by RouteId from local storage.
+    """
+    trackers = load_items("trackers")
+    initial_len = len(trackers)
+    filtered = [t for t in trackers if t.get("RouteId") != str(route_id)]
+    if len(filtered) < initial_len:
+        save_items("trackers", filtered)
+        return True
+    return False

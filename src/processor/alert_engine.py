@@ -214,8 +214,21 @@ def evaluate_route_price_alerts():
     
     for route in active_routes:
         route_id = route.get("RouteId", route.get("route_id"))
+        status = route.get("Status", "Active")
         target_price = float(route.get("TargetPrice", route.get("target_price", 0)))
         user_id = route.get("UserId", route.get("email"))
+
+        if status == "Paused":
+            evaluation_results.append({
+                "RouteId": route_id,
+                "Origin": route.get("Origin", route.get("origin")),
+                "Destination": route.get("Destination", route.get("destination")),
+                "TargetPrice": target_price,
+                "CurrentPrice": 0.0,
+                "AlertTriggered": False,
+                "Status": "Skipped (Tracker is Paused)"
+            })
+            continue
         
         # 1. Fetch latest price
         latest_price_info = get_latest_price_history(route_id)

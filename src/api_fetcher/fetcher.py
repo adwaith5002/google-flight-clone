@@ -217,6 +217,11 @@ def lambda_handler(event, context):
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     
     for route in routes_to_process:
+        status = route.get("Status", "Active")
+        if status == "Paused":
+            logger.info(f"Skipping price fetch for paused route {route.get('RouteId')}")
+            continue
+
         route_id = route.get("RouteId", route.get("route_id", f"TRK-{random.randint(1000, 9999)}"))
         origin = route.get("Origin", route.get("origin", "TRV"))
         destination = route.get("Destination", route.get("destination", "BLR"))
