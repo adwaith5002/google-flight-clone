@@ -4,18 +4,8 @@ This document summarizes the GitHub user configuration, repository synchronizati
 
 ---
 
-## 👤 1. Git Repository & User Configuration
 
-The repository was configured locally for this project with the specified GitHub user details and synchronized with the upstream remote repository:
-
-- **Git Username**: `MBalajiSakthivel007`
-- **Git Email**: `balajisakthivel861@gmail.com`
-- **Remote Repository URL**: `https://github.com/adwaith5002/google-flight-clone`
-- **Branch**: `main` (synchronized with `origin/main`)
-
----
-
-## ✨ 2. Summary of 5 New Features Added
+## ✨ 1. Summary of 5 New Features Added
 
 ### Feature 1: 📊 Price Analytics & Price Trend Indicator Engine
 - **Module**: [`src/processor/analytics.py`](file:///d:/balaji/src/processor/analytics.py)
